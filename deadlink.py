@@ -1,252 +1,165 @@
 import requests
-import os
-import threading
-from queue import Queue
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import (
-    urljoin, urlparse, urlsplit,
-    urlunsplit, unquote, quote, urlunparse
-)
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-import time
-import logging
-from xml.etree import ElementTree
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import difflib
 
-# 配置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-class AccurateLinkChecker:
-    def __init__(self, start_url, max_workers=None):
-        # 自动计算线程数
-        cpu_count = os.cpu_count() or 1
-        self.max_workers = min(32, cpu_count * 4 + 4) if max_workers is None else max_workers
-        
-        # 初始化参数
-        self.start_url = self.normalize_url(start_url)
-        self.base_domain = urlparse(self.start_url).netloc.split(':')[0]
-        
-        # 状态管理
-        self.visited = set()
-        self.all_links = set()
-        self.dead_links = []  # 存储元组 (url, status_code, error)
+class LinkChecker:
+    def __init__(self, start_url, max_workers=4):
+        self.base_url = self.normalize_url(start_url)
+        self.base_domain = urlparse(start_url).netloc
+        self.homepage_features = self.get_homepage_features()
         self.lock = threading.Lock()
-        self.task_queue = Queue()
-        self.task_queue.put(self.start_url)
-        
-        # 请求配置
+        self.visited = set()
+        self.dead_links = []
+        self.task_queue = deque([self.base_url])
+        self.max_workers = max_workers
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': self.start_url
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
         })
-        self.timeout = 15
-        self.retries = 2  # 重试次数
 
-    @staticmethod
-    def normalize_url(url):
-        """标准化URL处理"""
-        parsed = urlsplit(url)
-        cleaned = urlunsplit((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path.rstrip('/'),
-            parsed.query,
-            ''  # 移除片段
-        ))
-        return unquote(cleaned).lower()
-
-    def encode_special_chars(self, url):
-        """安全编码URL"""
+    def normalize_url(self, url):
+        """标准化URL格式"""
         parsed = urlparse(url)
-        encoded_path = '/'.join(
-            [quote(p, safe='') for p in parsed.path.split('/')]
-        )
-        encoded_query = quote(parsed.query, safe='=&')
-        return urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            encoded_path,
-            parsed.params,
-            encoded_query,
-            parsed.fragment
-        ))
+        return parsed._replace(
+            path=parsed.path.rstrip('/'),
+            query='',
+            fragment=''
+        ).geturl().lower()
 
-    def is_internal_link(self, url):
-        """内部链接检测"""
-        link_domain = urlparse(url).netloc.split(':')[0]
-        return link_domain == self.base_domain
+    def get_homepage_features(self):
+        """获取首页特征用于相似度比对"""
+        try:
+            resp = self.session.get(self.base_url, timeout=10)
+            return self.extract_features(resp.text)
+        except Exception as e:
+            print(f"首页特征获取失败: {str(e)}")
+            return []
 
-    def extract_links(self, content, base_url, content_type):
-        """多格式链接提取"""
-        links = set()
-        
-        # XML处理
-        if 'xml' in content_type:
-            try:
-                root = ElementTree.fromstring(content)
-                for elem in root.iter():
-                    if any(tag in elem.tag for tag in ['loc', 'url']):
-                        if elem.text:
-                            links.add(elem.text.strip())
-            except Exception as e:
-                logging.warning(f"XML解析失败: {str(e)}")
-                soup = BeautifulSoup(content, 'xml')
-                for tag in soup.find_all(['loc', 'url', 'link', 'guid']):
-                    if tag.text:
-                        links.add(tag.text.strip())
-                    if tag.has_attr('href'):
-                        links.add(tag['href'].strip())
-        
-        # HTML处理
-        else:
-            soup = BeautifulSoup(content, 'html.parser')
-            for tag in soup.find_all('a', href=True):
-                links.add(tag['href'])
-        
-        # 标准化处理
-        processed = set()
-        for link in links:
-            try:
-                absolute = urljoin(base_url, unquote(link))
-                normalized = self.normalize_url(absolute)
-                if self.is_internal_link(normalized):
-                    processed.add(normalized)
-            except Exception as e:
-                logging.error(f"链接处理异常: {link} - {str(e)}")
-        
-        return processed
+    def extract_features(self, text):
+        """提取页面特征"""
+        clean_text = text.replace('\n', ' ').strip()[:2000]
+        return [
+            len(clean_text),          # 文本长度
+            clean_text.count(' '),    # 空格数量
+            clean_text.count('<div'), # 结构特征
+            clean_text.count('href=') # 链接数量
+        ]
 
-    def handle_request(self, url):
-        """带重试机制的请求处理"""
-        encoded_url = self.encode_special_chars(url)
-        
-        for attempt in range(self.retries + 1):
-            try:
-                response = self.session.get(
-                    encoded_url,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                    stream=True
-                )
-                
-                # 处理重定向链
-                if response.history:
-                    logging.info(f"重定向路径: {url} -> {response.url}")
-                
-                return response, None
-                
-            except requests.exceptions.SSLError as e:
-                logging.warning(f"SSL错误 [{url}]: {str(e)}")
-                return None, ('SSL Error', str(e))
-            except requests.exceptions.Timeout as e:
-                if attempt == self.retries:
-                    logging.warning(f"请求超时 [{url}]")
-                    return None, ('Timeout', str(e))
-                time.sleep(1)
-            except requests.exceptions.TooManyRedirects as e:
-                logging.warning(f"重定向过多 [{url}]")
-                return None, ('TooManyRedirects', str(e))
-            except requests.exceptions.RequestException as e:
-                logging.error(f"请求异常 [{url}]: {str(e)}")
-                return None, (type(e).__name__, str(e))
-        
-        return None, ('MaxRetriesExceeded', '')
+    def is_similar_to_homepage(self, content):
+        """改进的相似度检测算法"""
+        if not self.homepage_features:
+            return False
+            
+        current_features = self.extract_features(content)
+        similarity = difflib.SequenceMatcher(
+            None, 
+            str(self.homepage_features),
+            str(current_features)
+        ).ratio()
+        return similarity > 0.8
 
-    def worker(self):
-        """工作线程逻辑"""
-        while True:
-            try:
-                current_url = self.task_queue.get(timeout=30)
+    def check_redirect_chain(self, response):
+        """分析重定向链有效性"""
+        # 直接访问错误
+        if response.status_code >= 400:
+            return True
+            
+        # 重定向到首页且内容相似
+        if response.url == self.base_url:
+            return self.is_similar_to_homepage(response.text)
+            
+        # 检查重定向历史
+        for resp in response.history:
+            if resp.status_code >= 400:
+                return True
                 
+        return False
+
+    def process_link(self, url):
+        """处理单个链接"""
+        try:
+            print(f"\n[处理] {url}")
+            
+            # 发送请求（禁用自动重定向以手动跟踪）
+            resp = self.session.get(url, allow_redirects=True, timeout=15)
+            
+            # 检测异常链接
+            if self.check_redirect_chain(resp):
                 with self.lock:
-                    if current_url in self.visited:
-                        self.task_queue.task_done()
-                        continue
-                    self.visited.add(current_url)
+                    self.dead_links.append({
+                        'url': url,
+                        'status': resp.status_code,
+                        'final_url': resp.url,
+                        'history': [r.status_code for r in resp.history]
+                    })
+                    print(f"!! 发现异常链接: {url}")
+            
+            # 提取页面链接
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for link in soup.find_all('a', href=True):
+                absolute_url = urljoin(url, link['href'])
+                parsed_url = urlparse(absolute_url)
                 
-                logging.info(f"检测中: {unquote(current_url)}")
-                
-                # 发送请求
-                response, error = self.handle_request(current_url)
-                
-                if error is not None:
+                # 域名校验和标准化
+                if parsed_url.netloc == self.base_domain:
+                    normalized = self.normalize_url(absolute_url)
+                    
                     with self.lock:
-                        self.dead_links.append((
-                            current_url,
-                            f"{error[0]} - {error[1]}"
-                        ))
-                    continue
-                
-                # 处理有效响应
-                final_url = self.normalize_url(response.url)
-                if final_url != current_url:
-                    with self.lock:
-                        if final_url not in self.visited:
-                            self.task_queue.put(final_url)
-                
-                # 状态码检测
-                if response.status_code >= 400:
-                    with self.lock:
-                        self.dead_links.append((
-                            current_url,
-                            f"HTTP {response.status_code}"
-                        ))
-                    logging.warning(f"发现异常状态码 [{response.status_code}]: {unquote(current_url)}")
-                    continue
-                
-                # 内容处理
-                content_type = response.headers.get('Content-Type', '')
-                try:
-                    content = response.content if 'xml' in content_type else response.text
-                    links = self.extract_links(
-                        content,
-                        final_url,
-                        content_type.split(';')[0]
-                    )
-                except UnicodeDecodeError:
-                    logging.warning(f"内容解码失败: {unquote(current_url)}")
-                    links = set()
-                
-                # 队列更新
-                with self.lock:
-                    new_links = links - self.all_links
-                    self.all_links.update(new_links)
-                    for link in new_links:
-                        self.task_queue.put(link)
-                
-                time.sleep(0.5)  # 流量控制
-                
-            except Exception as e:
-                if 'empty' not in str(e):
-                    logging.error(f"线程异常: {str(e)}")
-                break
+                        if normalized not in self.visited:
+                            self.visited.add(normalized)
+                            self.task_queue.append(normalized)
+                            print(f"发现新链接: {normalized}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"请求错误: {url} - {str(e)}")
+            with self.lock:
+                self.dead_links.append({
+                    'url': url,
+                    'error': str(e)
+                })
+        except Exception as e:
+            print(f"处理异常: {url} - {str(e)}")
 
     def run(self):
-        """运行检测器"""
+        """启动检测任务"""
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            logging.info(f"启动检测器，线程数: {self.max_workers}")
-            
-            # 提交初始任务
-            futures = [executor.submit(self.worker) for _ in range(self.max_workers)]
-            
-            # 等待任务完成
-            while not self.task_queue.empty():
-                time.sleep(1)
-            
-            executor.shutdown(wait=True)
-        
+            while True:
+                batch = []
+                
+                # 获取任务批次
+                with self.lock:
+                    if not self.task_queue:
+                        if threading.active_count() <= 1:
+                            break
+                        continue
+                        
+                    for _ in range(min(10, len(self.task_queue))):
+                        batch.append(self.task_queue.popleft())
+                
+                # 提交任务
+                futures = [executor.submit(self.process_link, url) for url in batch]
+                
+                # 等待完成
+                for future in futures:
+                    future.result()
+
         return self.dead_links
 
 if __name__ == "__main__":
-    checker = AccurateLinkChecker("https://blog.jackeylea.com")
+    # 使用示例
+    checker = LinkChecker("https://blog.jackeylea.com")
     results = checker.run()
     
-    print("\n检测结果:")
-    print(f"{'序号':<5} | {'URL':<60} | {'错误类型'}")
-    print("-" * 90)
-    for idx, (url, error) in enumerate(results, 1):
-        print(f"{idx:<5} | {unquote(url):<60} | {error}")
+    print("\n检测结果：")
+    for item in results:
+        if 'error' in item:
+            print(f"[错误] {item['url']} - {item['error']}")
+        else:
+            print(f"[{item['status']}] {item['url']}")
+            print(f"    最终地址: {item['final_url']}")
+            print(f"    重定向链: {item['history']}")
